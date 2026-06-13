@@ -5,9 +5,11 @@ COPY package*.json ./
 RUN npm install --omit=dev
 
 COPY server.js ./
+COPY run.sh /opt/application/run.sh
+RUN chmod +x /opt/application/run.sh
 
 ENV NODE_ENV=production
-ENV PORT=8080
-EXPOSE 8080
+ENV PORT=8000
+EXPOSE 8000
 
-CMD ["npm", "start"]
+CMD ["/opt/application/run.sh"]
