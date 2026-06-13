@@ -107,7 +107,7 @@ app.use(bodyParser());
 app.use(router.routes());
 app.use(router.allowedMethods());
 
-const port = Number(process.env.PORT || 8080);
+const port = Number(process.env.BYTEFAAS_RUNTIME_PORT || 8000);
 app.listen(port, '0.0.0.0', () => {
   console.log(`wokedu OCR service listening on ${port}`);
 });
