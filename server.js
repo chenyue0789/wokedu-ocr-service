@@ -4,17 +4,20 @@ import cors from '@koa/cors';
 import bodyParser from 'koa-bodyparser';
 import multer from '@koa/multer';
 import { createWorker } from 'tesseract.js';
+import sharp from 'sharp';
 
 const app = new Koa();
 const router = new Router();
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: 8 * 1024 * 1024
+    fileSize: 4 * 1024 * 1024
   }
 });
 
 let workerPromise;
+let workerInstance = null;
+const OCR_TIMEOUT_MS = 45_000;
 
 function cleanOcrText(text) {
   return String(text || '')
@@ -32,17 +35,49 @@ async function getWorker() {
       });
       await worker.setParameters({
         preserve_interword_spaces: '1',
-        tessedit_pageseg_mode: '6'
+        tessedit_pageseg_mode: '6',
+        tessedit_char_blacklist: '|'
       });
+      workerInstance = worker;
       return worker;
     })();
   }
   return workerPromise;
 }
 
+async function normalizeImage(buffer) {
+  return sharp(buffer, { limitInputPixels: 12_000_000 })
+    .rotate()
+    .resize({
+      width: 1600,
+      height: 1600,
+      fit: 'inside',
+      withoutEnlargement: true
+    })
+    .grayscale()
+    .normalize()
+    .jpeg({ quality: 82, mozjpeg: true })
+    .toBuffer();
+}
+
+async function withTimeout(promise, ms) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error('ocr_timeout')), ms);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function recognize(buffer) {
-  const worker = await getWorker();
-  const result = await worker.recognize(buffer);
+  const result = await withTimeout((async () => {
+    const input = await normalizeImage(buffer);
+    const worker = await getWorker();
+    return worker.recognize(input);
+  })(), OCR_TIMEOUT_MS);
   const rawText = result?.data?.text || '';
   const text = cleanOcrText(rawText);
   const lines = (result?.data?.lines || [])
@@ -88,6 +123,28 @@ async function handleOcr(ctx) {
       data
     };
   } catch (error) {
+    if (error?.message === 'ocr_timeout') {
+      if (workerInstance) {
+        workerInstance.terminate().catch(() => {});
+      }
+      workerInstance = null;
+      workerPromise = null;
+      ctx.body = {
+        ok: true,
+        text: '',
+        lines: [],
+        words_result: [],
+        warning: 'ocr_timeout',
+        message: '图片识别耗时较长，请换一张更清晰的横向试题照片重试。',
+        data: {
+          text: '',
+          lines: [],
+          words_result: []
+        }
+      };
+      return;
+    }
+
     ctx.status = 500;
     ctx.body = {
       ok: false,
