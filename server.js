@@ -17,8 +17,13 @@ const upload = multer({
 
 let workerPromise;
 let workerInstance = null;
+let baiduTokenCache = null;
+
 const OCR_TIMEOUT_MS = 50_000;
 const OCR_SPACE_ENDPOINT = 'https://api.ocr.space/parse/image';
+const BAIDU_TOKEN_ENDPOINT = 'https://aip.baidubce.com/oauth/2.0/token';
+const BAIDU_PAPER_CUT_ENDPOINT = 'https://aip.baidubce.com/rest/2.0/ocr/v1/paper_cut_edu';
+const BAIDU_DOC_ANALYSIS_ENDPOINT = 'https://aip.baidubce.com/rest/2.0/ocr/v1/doc_analysis';
 
 function cleanOcrText(text) {
   return String(text || '')
@@ -28,6 +33,25 @@ function cleanOcrText(text) {
     .replace(/[ \t]{2,}/g, ' ')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+}
+
+function compactLines(lines) {
+  return lines
+    .map((line) => cleanOcrText(line))
+    .filter(Boolean);
+}
+
+function makeOcrResponse({ lines, confidence = 0, provider, variant, extra = {} }) {
+  const cleanLines = compactLines(lines);
+  return {
+    text: cleanLines.join('\n'),
+    lines: cleanLines,
+    words_result: cleanLines.map((words) => ({ words })),
+    confidence,
+    ocr_variant: variant,
+    ocr_provider: provider,
+    ...extra
+  };
 }
 
 async function getWorker() {
@@ -89,7 +113,23 @@ async function withTimeout(promise, ms) {
   }
 }
 
+function hasBaiduCredentials() {
+  return Boolean(
+    process.env.BAIDU_ACCESS_TOKEN ||
+      ((process.env.BAIDU_OCR_API_KEY || process.env.BAIDU_API_KEY) &&
+        (process.env.BAIDU_OCR_SECRET_KEY || process.env.BAIDU_SECRET_KEY))
+  );
+}
+
 async function recognize(buffer) {
+  if (hasBaiduCredentials()) {
+    try {
+      return await withTimeout(recognizeWithBaidu(buffer), 35_000);
+    } catch (error) {
+      console.warn('baidu OCR failed, fallback to ocr.space/local:', error?.message || error);
+    }
+  }
+
   if (process.env.OCR_SPACE_API_KEY) {
     try {
       return await withTimeout(recognizeWithOcrSpace(buffer), 20_000);
@@ -98,7 +138,11 @@ async function recognize(buffer) {
     }
   }
 
-  const result = await withTimeout((async () => {
+  return withTimeout(recognizeWithTesseract(buffer), OCR_TIMEOUT_MS);
+}
+
+async function recognizeWithTesseract(buffer) {
+  const result = await (async () => {
     const variants = await buildImageVariants(buffer);
     const worker = await getWorker();
     let best = null;
@@ -123,21 +167,19 @@ async function recognize(buffer) {
     }
 
     return best;
-  })(), OCR_TIMEOUT_MS);
-  const rawText = result?.result?.data?.text || '';
-  const text = result?.text || cleanOcrText(rawText);
+  })();
+
+  const text = result?.text || cleanOcrText(result?.result?.data?.text || '');
   const lines = (result?.result?.data?.lines || [])
     .map((line) => cleanOcrText(line.text))
     .filter(Boolean);
 
-  return {
-    text,
-    lines,
-    words_result: lines.map((words) => ({ words })),
+  return makeOcrResponse({
+    lines: lines.length ? lines : text.split(/\n+/),
     confidence: result?.result?.data?.confidence || 0,
-    ocr_variant: result?.variant || 'unknown',
-    ocr_provider: 'tesseract'
-  };
+    variant: result?.variant || 'unknown',
+    provider: 'tesseract'
+  });
 }
 
 async function recognizeWithOcrSpace(buffer) {
@@ -165,16 +207,206 @@ async function recognizeWithOcrSpace(buffer) {
 
   const parsed = payload?.ParsedResults?.[0];
   const text = cleanOcrText(parsed?.ParsedText || '');
-  const lines = text.split(/\n+/).map((line) => cleanOcrText(line)).filter(Boolean);
 
-  return {
-    text,
-    lines,
-    words_result: lines.map((words) => ({ words })),
+  return makeOcrResponse({
+    lines: text.split(/\n+/),
     confidence: 80,
-    ocr_variant: 'ocr_space_engine_2',
-    ocr_provider: 'ocr.space'
+    variant: 'ocr_space_engine_2',
+    provider: 'ocr.space'
+  });
+}
+
+async function getBaiduAccessToken() {
+  if (process.env.BAIDU_ACCESS_TOKEN) {
+    return process.env.BAIDU_ACCESS_TOKEN;
+  }
+
+  const now = Date.now();
+  if (baiduTokenCache && baiduTokenCache.expiresAt > now + 60_000) {
+    return baiduTokenCache.token;
+  }
+
+  const apiKey = process.env.BAIDU_OCR_API_KEY || process.env.BAIDU_API_KEY;
+  const secretKey = process.env.BAIDU_OCR_SECRET_KEY || process.env.BAIDU_SECRET_KEY;
+  const url = new URL(BAIDU_TOKEN_ENDPOINT);
+  url.searchParams.set('grant_type', 'client_credentials');
+  url.searchParams.set('client_id', apiKey);
+  url.searchParams.set('client_secret', secretKey);
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json'
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error(`baidu_token_http_${response.status}`);
+  }
+
+  const payload = await response.json();
+  if (!payload?.access_token) {
+    throw new Error(payload?.error_description || payload?.error || 'baidu_token_missing');
+  }
+
+  baiduTokenCache = {
+    token: payload.access_token,
+    expiresAt: now + Math.max(60, Number(payload.expires_in || 2_592_000) - 300) * 1000
   };
+  return baiduTokenCache.token;
+}
+
+async function callBaiduOcr(endpoint, buffer, params) {
+  const token = await getBaiduAccessToken();
+  const url = new URL(endpoint);
+  url.searchParams.set('access_token', token);
+
+  const body = new URLSearchParams({
+    image: buffer.toString('base64'),
+    ...params
+  });
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
+    body
+  });
+
+  if (!response.ok) {
+    throw new Error(`baidu_ocr_http_${response.status}`);
+  }
+
+  const payload = await response.json();
+  if (payload?.error_code || payload?.error_msg) {
+    throw new Error(`baidu_${payload.error_code || 'error'}_${payload.error_msg || ''}`);
+  }
+
+  return payload;
+}
+
+async function recognizeWithBaidu(buffer) {
+  const errors = [];
+
+  try {
+    const paperCutPayload = await callBaiduOcr(BAIDU_PAPER_CUT_ENDPOINT, buffer, {
+      language_type: 'CHN_ENG',
+      detect_direction: 'true',
+      words_type: 'handprint_mix',
+      splice_text: 'true',
+      enhance: 'true',
+      only_split: 'false'
+    });
+    const result = parseBaiduPaperCut(paperCutPayload);
+    if (scoreOcrText(result.text) >= 10) {
+      return result;
+    }
+  } catch (error) {
+    errors.push(error?.message || String(error));
+  }
+
+  try {
+    const docPayload = await callBaiduOcr(BAIDU_DOC_ANALYSIS_ENDPOINT, buffer, {
+      language_type: 'CHN_ENG',
+      result_type: 'big',
+      detect_direction: 'true',
+      line_probability: 'true',
+      words_type: 'handprint_mix',
+      layout_analysis: 'true',
+      recg_formula: 'true',
+      recg_long_division: 'true'
+    });
+    return parseBaiduDocAnalysis(docPayload);
+  } catch (error) {
+    errors.push(error?.message || String(error));
+  }
+
+  throw new Error(errors.join('; ') || 'baidu_ocr_failed');
+}
+
+function parseBaiduPaperCut(payload) {
+  const questions = [];
+  const lines = [];
+
+  for (const question of payload?.qus_result || []) {
+    const elemText = question?.elem_text || {};
+    const structuredText = [
+      elemText.stem_text,
+      elemText.subqus_text,
+      elemText.option_text,
+      elemText.answer_text,
+      elemText.interpretation_text
+    ].filter(Boolean);
+
+    const elementLines = [];
+    for (const element of question?.qus_element || []) {
+      for (const word of element?.elem_word || []) {
+        if (word?.word) {
+          elementLines.push(word.word);
+        }
+      }
+    }
+
+    const questionLines = compactLines(structuredText.length ? structuredText : elementLines);
+    if (questionLines.length) {
+      lines.push(...questionLines);
+      questions.push({
+        type: question.qus_type,
+        confidence: question.qus_probability,
+        text: questionLines.join('\n')
+      });
+    }
+  }
+
+  return makeOcrResponse({
+    lines: lines.length ? lines : extractTextLines(payload),
+    confidence: 90,
+    variant: 'baidu_paper_cut_edu',
+    provider: 'baidu',
+    extra: {
+      questions,
+      baidu_log_id: payload?.log_id
+    }
+  });
+}
+
+function parseBaiduDocAnalysis(payload) {
+  return makeOcrResponse({
+    lines: extractTextLines(payload),
+    confidence: 88,
+    variant: 'baidu_doc_analysis',
+    provider: 'baidu',
+    extra: {
+      baidu_log_id: payload?.log_id
+    }
+  });
+}
+
+function extractTextLines(value, lines = []) {
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      extractTextLines(item, lines);
+    }
+    return lines;
+  }
+
+  if (!value || typeof value !== 'object') {
+    return lines;
+  }
+
+  for (const [key, child] of Object.entries(value)) {
+    if (
+      typeof child === 'string' &&
+      /^(word|words|text|content|elem_text|stem_text|option_text|answer_text|interpretation_text)$/i.test(key)
+    ) {
+      lines.push(child);
+    } else if (typeof child === 'object') {
+      extractTextLines(child, lines);
+    }
+  }
+
+  return lines;
 }
 
 function scoreOcrText(text) {
@@ -190,7 +422,8 @@ router.get('/', (ctx) => {
   ctx.body = {
     ok: true,
     service: 'wokedu-ocr-service',
-    endpoints: ['/api/ocr/recognize', '/ocr/recognize', '/vision/ocr', '/ai/ocr']
+    endpoints: ['/api/ocr/recognize', '/ocr/recognize', '/vision/ocr', '/ai/ocr'],
+    providers: ['baidu', 'ocr.space', 'tesseract']
   };
 });
 
