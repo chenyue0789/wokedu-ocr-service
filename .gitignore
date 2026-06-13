@@ -1,0 +1,4 @@
+node_modules/
+*.traineddata
+.server.pid
+npm-debug.log
